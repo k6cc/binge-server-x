@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -45,16 +46,23 @@ var sourceLabels = map[string]string{
 const socialParentTag = "Social Media"
 
 type Saver struct {
-	stash *stash.Client
-	http  *http.Client
+	stash  *stash.Client
+	http   *http.Client
+	logger *slog.Logger
 
 	mu        sync.RWMutex
 	writeRoot string // path THIS daemon writes to (e.g. /library/social)
 	stashRoot string // path Stash sees the same files at (e.g. Z:\Media\social)
 }
 
-func New(st *stash.Client) *Saver {
-	return &Saver{stash: st, http: &http.Client{Timeout: 180 * time.Second}}
+func New(st *stash.Client, logger *slog.Logger) *Saver {
+	return &Saver{stash: st, http: &http.Client{Timeout: 180 * time.Second}, logger: logger}
+}
+
+func (s *Saver) log(msg, detail string) {
+	if s.logger != nil {
+		s.logger.Warn(msg, "detail", detail)
+	}
 }
 
 // SetPaths updates the write/stash roots (from env seed or POST /config).
@@ -91,9 +99,11 @@ type SaveRequest struct {
 
 type SaveResult struct {
 	StashType string `json:"stashType"` // scene | image
-	StashID   string `json:"stashId"`
 	Path      string `json:"path"`
 	Handle    string `json:"handle"`
+	// Pending = file saved + scan triggered; metadata is being applied in
+	// the background (lands once Stash finishes scanning).
+	Pending bool `json:"pending"`
 }
 
 func (s *Saver) Save(ctx context.Context, req SaveRequest) (*SaveResult, error) {
@@ -141,50 +151,65 @@ func (s *Saver) Save(ctx context.Context, req SaveRequest) (*SaveResult, error) 
 	stashDir := strings.Join([]string{stashRoot, src, handle}, sep)
 	stashPath := stashDir + sep + filename
 
+	// Download + scan happen up front (so failures surface to the caller),
+	// but the file may not register in Stash for a while when the scan
+	// queue is backed up. So tagging runs in the background and the caller
+	// gets an immediate "queued" result — the file is on disk + scanning,
+	// and the metadata lands when the scan completes.
 	if err := s.download(ctx, req, writeDir, writePath); err != nil {
 		return nil, fmt.Errorf("download: %w", err)
 	}
-
 	if err := s.stash.MetadataScan(ctx, []string{stashDir}); err != nil {
 		return nil, fmt.Errorf("scan: %w", err)
 	}
 
-	// Poll until the scan has registered the file.
-	stashID, stashType := "", ""
-	deadline := time.Now().Add(45 * time.Second)
-	for time.Now().Before(deadline) {
+	stashType := "image"
+	if req.Kind == "video" {
+		stashType = "scene"
+	}
+	go s.tagWhenScanned(req, label, base, stashType, stashPath, handle)
+
+	return &SaveResult{StashType: stashType, Path: stashPath, Handle: handle, Pending: true}, nil
+}
+
+// tagWhenScanned polls (detached from the request) until the scan has
+// registered the placed file, then writes the source studio/tag +
+// performer/url/date/caption. Best-effort: the file is already saved, so
+// a failure here just leaves an untagged item.
+func (s *Saver) tagWhenScanned(req SaveRequest, label, token, stashType, stashPath, handle string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	var stashID string
+	for stashID == "" {
 		var id string
-		var err error
-		if req.Kind == "video" {
-			id, err = s.stash.FindSceneIDByPath(ctx, base, stashPath)
-			stashType = "scene"
+		if stashType == "scene" {
+			id, _ = s.stash.FindSceneIDByPath(ctx, token, stashPath)
 		} else {
-			id, err = s.stash.FindImageIDByPath(ctx, base, stashPath)
-			stashType = "image"
+			id, _ = s.stash.FindImageIDByPath(ctx, token, stashPath)
 		}
-		if err == nil && id != "" {
+		if id != "" {
 			stashID = id
 			break
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(2 * time.Second):
+			s.log("save tag timed out (file saved, untagged)", stashPath)
+			return
+		case <-time.After(3 * time.Second):
 		}
-	}
-	if stashID == "" {
-		return nil, fmt.Errorf("file placed at %s but Stash hasn't registered it yet", stashPath)
 	}
 
 	studioID, err := s.stash.EnsureStudio(ctx, label)
 	if err != nil {
-		return nil, fmt.Errorf("ensure studio: %w", err)
+		s.log("ensure studio failed", err.Error())
+		return
 	}
 	tagID, err := s.stash.EnsureTag(ctx, label, socialParentTag)
 	if err != nil {
-		return nil, fmt.Errorf("ensure tag: %w", err)
+		s.log("ensure tag failed", err.Error())
+		return
 	}
-
 	meta := stash.EntityMeta{
 		PerformerID: req.PerformerStashID,
 		StudioID:    studioID,
@@ -199,10 +224,8 @@ func (s *Saver) Save(ctx context.Context, req SaveRequest) (*SaveResult, error) 
 		err = s.stash.UpdateImageMeta(ctx, stashID, meta)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("metadata: %w", err)
+		s.log("save metadata write failed", err.Error())
 	}
-
-	return &SaveResult{StashType: stashType, StashID: stashID, Path: stashPath, Handle: handle}, nil
 }
 
 func (s *Saver) download(ctx context.Context, req SaveRequest, dir, dest string) error {

@@ -74,7 +74,7 @@ func main() {
 
 	// Social "save to Stash" pipeline (downloads + places + tags). Paths
 	// come from config; unset = feature off (API 503s, UI hides the button).
-	saverSvc := social.New(stashClient)
+	saverSvc := social.New(stashClient, log.With("component", "saver"))
 	saverSvc.SetPaths(store.Get(configstore.KeySocialWriteRoot), store.Get(configstore.KeySocialStashRoot))
 
 	pollerSvc := poller.New(
