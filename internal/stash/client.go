@@ -112,6 +112,26 @@ query BingeServerAllPerformers($page: Int!, $perPage: Int!) {
   }
 }`
 
+// FetchPerformer returns a single performer by Stash id — used by the
+// on-demand X feed to resolve a performer's twitter/x handle without
+// touching the local DB (which is reddit-handle scoped).
+func (c *Client) FetchPerformer(ctx context.Context, id string) (Performer, error) {
+	const q = `
+query BingeServerPerformer($id: ID!) {
+  findPerformer(id: $id) { id name image_path favorite urls }
+}`
+	var resp struct {
+		FindPerformer *Performer `json:"findPerformer"`
+	}
+	if err := c.do(ctx, q, map[string]any{"id": id}, &resp); err != nil {
+		return Performer{}, err
+	}
+	if resp.FindPerformer == nil {
+		return Performer{}, fmt.Errorf("performer %s not found", id)
+	}
+	return *resp.FindPerformer, nil
+}
+
 func (c *Client) FetchPerformersPage(ctx context.Context, page, perPage int) ([]Performer, int, error) {
 	var resp struct {
 		FindPerformers struct {

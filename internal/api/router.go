@@ -19,6 +19,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/ordureconnoisseur/binge-server/internal/configstore"
+	"github.com/ordureconnoisseur/binge-server/internal/stash"
+	"github.com/ordureconnoisseur/binge-server/internal/twitter"
 )
 
 // Poller is the slim interface the API needs — a synchronous PollAll.
@@ -28,13 +30,17 @@ type Poller interface {
 }
 
 type Server struct {
-	db     *sql.DB
-	store  *configstore.Store
-	poller Poller
-	log    *slog.Logger
+	db      *sql.DB
+	store   *configstore.Store
+	poller  Poller
+	stash   *stash.Client
+	twitter *twitter.Client
+	log     *slog.Logger
 
 	refreshMu     sync.Mutex
 	lastRefreshAt time.Time
+
+	xCache *xFeedCache
 
 	allowedOrigins []string // CORS allowlist (parsed); loopback always OK
 }
@@ -43,12 +49,15 @@ type Server struct {
 // polls. Manual hammering won't translate to bursts on Reddit.
 const refreshCooldown = 30 * time.Second
 
-func New(db *sql.DB, store *configstore.Store, poller Poller, log *slog.Logger, allowedOrigin string) *Server {
+func New(db *sql.DB, store *configstore.Store, poller Poller, stashClient *stash.Client, twitterClient *twitter.Client, log *slog.Logger, allowedOrigin string) *Server {
 	return &Server{
 		db:             db,
 		store:          store,
 		poller:         poller,
+		stash:          stashClient,
+		twitter:        twitterClient,
 		log:            log,
+		xCache:         newXFeedCache(),
 		allowedOrigins: parseOrigins(allowedOrigin),
 	}
 }
@@ -67,6 +76,8 @@ func (s *Server) Router() http.Handler {
 	r.Head("/redgifs/proxy", s.proxyRedgifs)
 	r.Get("/reddit/proxy", s.proxyReddit)
 	r.Head("/reddit/proxy", s.proxyReddit)
+	r.Get("/x/feed/{stashId}", s.xFeed)
+	r.Get("/x/handle/{handle}", s.xFeedByHandle)
 	return r
 }
 
@@ -246,12 +257,16 @@ type configGetResponse struct {
 	StashURL        string `json:"stashUrl"`
 	StashAPIKeySet  bool   `json:"stashApiKeySet"`
 	RedditCookieSet bool   `json:"redditCookieSet"`
+	XCookiesSet     bool   `json:"xCookiesSet"`
 }
 
 type configPostRequest struct {
 	StashURL            *string `json:"stashUrl,omitempty"`
 	StashAPIKey         *string `json:"stashApiKey,omitempty"`
 	RedditSessionCookie *string `json:"redditSessionCookie,omitempty"`
+	// X (Twitter) session cookies — must be set together.
+	XAuthToken *string `json:"xAuthToken,omitempty"`
+	XCT0       *string `json:"xCt0,omitempty"`
 }
 
 func (s *Server) getConfig(w http.ResponseWriter, _ *http.Request) {
@@ -259,6 +274,7 @@ func (s *Server) getConfig(w http.ResponseWriter, _ *http.Request) {
 		StashURL:        s.store.Get(configstore.KeyStashURL),
 		StashAPIKeySet:  s.store.Get(configstore.KeyStashAPIKey) != "",
 		RedditCookieSet: s.store.Get(configstore.KeyRedditCookie) != "",
+		XCookiesSet:     s.store.Get(configstore.KeyXAuthToken) != "" && s.store.Get(configstore.KeyXCT0) != "",
 	})
 }
 
@@ -325,6 +341,24 @@ func (s *Server) postConfig(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "persist failed"})
 			return
 		}
+	}
+	// X cookies — both must be provided together (auth_token is useless
+	// without the matching ct0 csrf token). Persisted then pushed into the
+	// twitter client so the change takes effect without a restart.
+	if req.XAuthToken != nil || req.XCT0 != nil {
+		if req.XAuthToken == nil || req.XCT0 == nil || *req.XAuthToken == "" || *req.XCT0 == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "xAuthToken and xCt0 must be set together"})
+			return
+		}
+		if err := s.store.Set(configstore.KeyXAuthToken, *req.XAuthToken); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "persist failed"})
+			return
+		}
+		if err := s.store.Set(configstore.KeyXCT0, *req.XCT0); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "persist failed"})
+			return
+		}
+		s.applyXCookies()
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})

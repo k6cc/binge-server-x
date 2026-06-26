@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/ordureconnoisseur/binge-server/internal/reddit"
 	"github.com/ordureconnoisseur/binge-server/internal/redgifs"
 	"github.com/ordureconnoisseur/binge-server/internal/stash"
+	"github.com/ordureconnoisseur/binge-server/internal/twitter"
 )
 
 // Version is set at build time via -ldflags "-X main.Version=v0.1.0".
@@ -50,6 +52,8 @@ func main() {
 	}
 	_ = store.SetIfEmpty(configstore.KeyStashAPIKey, cfg.stashAPIKey)
 	_ = store.SetIfEmpty(configstore.KeyRedditCookie, cfg.redditCookie)
+	_ = store.SetIfEmpty(configstore.KeyXAuthToken, cfg.xAuthToken)
+	_ = store.SetIfEmpty(configstore.KeyXCT0, cfg.xCT0)
 
 	// Clients start with whatever's in the store (possibly empty
 	// strings). The poller will read fresh values + push them in via
@@ -58,13 +62,20 @@ func main() {
 	redditClient := reddit.New(store.Get(configstore.KeyRedditCookie), cfg.redditUserAgent)
 	redgifsClient := redgifs.New(cfg.redditUserAgent)
 
+	// X (Twitter) media client — shells out to gallery-dl, config written
+	// next to the SQLite DB (the mounted, writable /data volume).
+	twitterClient := twitter.New(filepath.Dir(cfg.dbPath), "gallery-dl")
+	if err := twitterClient.SetCookies(store.Get(configstore.KeyXAuthToken), store.Get(configstore.KeyXCT0)); err != nil {
+		log.Warn("x cookie setup failed", "err", err)
+	}
+
 	pollerSvc := poller.New(
 		database, store, stashClient, redditClient, redgifsClient,
 		log.With("component", "poller"),
 		cfg.performerSyncInterval, cfg.pollInterval,
 	)
 
-	server := api.New(database, store, pollerSvc, log.With("component", "api"), cfg.allowedOrigin)
+	server := api.New(database, store, pollerSvc, stashClient, twitterClient, log.With("component", "api"), cfg.allowedOrigin)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -101,6 +112,8 @@ type config struct {
 	stashURL              string // optional seed
 	stashAPIKey           string // optional seed
 	redditCookie          string // optional seed
+	xAuthToken            string // optional seed (X session cookie)
+	xCT0                  string // optional seed (X csrf cookie)
 	redditUserAgent       string
 	pollInterval          time.Duration
 	performerSyncInterval time.Duration
@@ -115,6 +128,8 @@ func loadConfig() config {
 		stashURL:              strings.TrimRight(envOr("STASH_URL", "http://localhost:9999"), "/"),
 		stashAPIKey:           os.Getenv("STASH_API_KEY"),
 		redditCookie:          os.Getenv("REDDIT_SESSION_COOKIE"),
+		xAuthToken:            os.Getenv("X_AUTH_TOKEN"),
+		xCT0:                  os.Getenv("X_CT0"),
 		redditUserAgent:       ua + " " + Version,
 		pollInterval:          envDuration("BINGE_POLL_INTERVAL", 4*time.Hour),
 		performerSyncInterval: envDuration("BINGE_PERFORMER_SYNC_INTERVAL", 24*time.Hour),

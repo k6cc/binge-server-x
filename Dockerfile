@@ -24,10 +24,17 @@ RUN go build -trimpath \
     -o /out/binge-server .
 
 # ── Runtime stage ──────────────────────────────────────────────────
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/binge-server /binge-server
+# python:slim (not distroless): the X/Twitter feed shells out to
+# gallery-dl, a Python tool. gallery-dl is intentionally UNPINNED — X
+# rotates its private GraphQL query-ids periodically and breaks older
+# gallery-dl; a plain image rebuild pulls the current release that fixes
+# it. (--no-download keeps us to metadata only, so no ffmpeg needed.)
+FROM python:3.12-slim
+RUN pip install --no-cache-dir gallery-dl
+COPY --from=build /out/binge-server /usr/local/bin/binge-server
 
-# Persistent data (SQLite). Mount a volume here.
+# Persistent data (SQLite + the generated gallery-dl cookie config).
+# Mount a volume here.
 VOLUME ["/data"]
 ENV BINGE_DB_PATH=/data/binge-server.db
 
@@ -37,5 +44,4 @@ ENV BINGE_DB_PATH=/data/binge-server.db
 ENV BINGE_LISTEN_ADDR=0.0.0.0:7878
 EXPOSE 7878
 
-USER nonroot:nonroot
-ENTRYPOINT ["/binge-server"]
+ENTRYPOINT ["binge-server"]
