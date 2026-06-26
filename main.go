@@ -18,6 +18,7 @@ import (
 	"github.com/ordureconnoisseur/binge-server/internal/poller"
 	"github.com/ordureconnoisseur/binge-server/internal/reddit"
 	"github.com/ordureconnoisseur/binge-server/internal/redgifs"
+	"github.com/ordureconnoisseur/binge-server/internal/social"
 	"github.com/ordureconnoisseur/binge-server/internal/stash"
 	"github.com/ordureconnoisseur/binge-server/internal/twitter"
 )
@@ -54,6 +55,8 @@ func main() {
 	_ = store.SetIfEmpty(configstore.KeyRedditCookie, cfg.redditCookie)
 	_ = store.SetIfEmpty(configstore.KeyXAuthToken, cfg.xAuthToken)
 	_ = store.SetIfEmpty(configstore.KeyXCT0, cfg.xCT0)
+	_ = store.SetIfEmpty(configstore.KeySocialWriteRoot, cfg.socialWriteRoot)
+	_ = store.SetIfEmpty(configstore.KeySocialStashRoot, cfg.socialStashRoot)
 
 	// Clients start with whatever's in the store (possibly empty
 	// strings). The poller will read fresh values + push them in via
@@ -69,13 +72,18 @@ func main() {
 		log.Warn("x cookie setup failed", "err", err)
 	}
 
+	// Social "save to Stash" pipeline (downloads + places + tags). Paths
+	// come from config; unset = feature off (API 503s, UI hides the button).
+	saverSvc := social.New(stashClient)
+	saverSvc.SetPaths(store.Get(configstore.KeySocialWriteRoot), store.Get(configstore.KeySocialStashRoot))
+
 	pollerSvc := poller.New(
 		database, store, stashClient, redditClient, redgifsClient,
 		log.With("component", "poller"),
 		cfg.performerSyncInterval, cfg.pollInterval,
 	)
 
-	server := api.New(database, store, pollerSvc, stashClient, twitterClient, log.With("component", "api"), cfg.allowedOrigin)
+	server := api.New(database, store, pollerSvc, stashClient, twitterClient, saverSvc, log.With("component", "api"), cfg.allowedOrigin)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -114,6 +122,8 @@ type config struct {
 	redditCookie          string // optional seed
 	xAuthToken            string // optional seed (X session cookie)
 	xCT0                  string // optional seed (X csrf cookie)
+	socialWriteRoot       string // optional seed (where this daemon writes saved media)
+	socialStashRoot       string // optional seed (path Stash sees those files at)
 	redditUserAgent       string
 	pollInterval          time.Duration
 	performerSyncInterval time.Duration
@@ -130,6 +140,8 @@ func loadConfig() config {
 		redditCookie:          os.Getenv("REDDIT_SESSION_COOKIE"),
 		xAuthToken:            os.Getenv("X_AUTH_TOKEN"),
 		xCT0:                  os.Getenv("X_CT0"),
+		socialWriteRoot:       os.Getenv("BINGE_SOCIAL_WRITE_ROOT"),
+		socialStashRoot:       os.Getenv("BINGE_SOCIAL_STASH_ROOT"),
 		redditUserAgent:       ua + " " + Version,
 		pollInterval:          envDuration("BINGE_POLL_INTERVAL", 4*time.Hour),
 		performerSyncInterval: envDuration("BINGE_PERFORMER_SYNC_INTERVAL", 24*time.Hour),

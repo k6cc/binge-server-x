@@ -21,6 +21,11 @@ const (
 	// same self-service-cookie pattern as the Reddit cookie above.
 	KeyXAuthToken = "x_auth_token"
 	KeyXCT0       = "x_ct0"
+	// Social "save to Stash" library roots. WriteRoot = the path THIS
+	// daemon writes to; StashRoot = the path Stash sees those same files
+	// at (they differ when the daemon and Stash are on different hosts).
+	KeySocialWriteRoot = "social_write_root"
+	KeySocialStashRoot = "social_stash_root"
 )
 
 type Store struct {

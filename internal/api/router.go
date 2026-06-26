@@ -19,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/ordureconnoisseur/binge-server/internal/configstore"
+	"github.com/ordureconnoisseur/binge-server/internal/social"
 	"github.com/ordureconnoisseur/binge-server/internal/stash"
 	"github.com/ordureconnoisseur/binge-server/internal/twitter"
 )
@@ -35,6 +36,7 @@ type Server struct {
 	poller  Poller
 	stash   *stash.Client
 	twitter *twitter.Client
+	saver   *social.Saver
 	log     *slog.Logger
 
 	refreshMu     sync.Mutex
@@ -49,13 +51,14 @@ type Server struct {
 // polls. Manual hammering won't translate to bursts on Reddit.
 const refreshCooldown = 30 * time.Second
 
-func New(db *sql.DB, store *configstore.Store, poller Poller, stashClient *stash.Client, twitterClient *twitter.Client, log *slog.Logger, allowedOrigin string) *Server {
+func New(db *sql.DB, store *configstore.Store, poller Poller, stashClient *stash.Client, twitterClient *twitter.Client, saver *social.Saver, log *slog.Logger, allowedOrigin string) *Server {
 	return &Server{
 		db:             db,
 		store:          store,
 		poller:         poller,
 		stash:          stashClient,
 		twitter:        twitterClient,
+		saver:          saver,
 		log:            log,
 		xCache:         newXFeedCache(),
 		allowedOrigins: parseOrigins(allowedOrigin),
@@ -78,6 +81,7 @@ func (s *Server) Router() http.Handler {
 	r.Head("/reddit/proxy", s.proxyReddit)
 	r.Get("/x/feed/{stashId}", s.xFeed)
 	r.Get("/x/handle/{handle}", s.xFeedByHandle)
+	r.Post("/save", s.saveToStash)
 	return r
 }
 
@@ -258,6 +262,11 @@ type configGetResponse struct {
 	StashAPIKeySet  bool   `json:"stashApiKeySet"`
 	RedditCookieSet bool   `json:"redditCookieSet"`
 	XCookiesSet     bool   `json:"xCookiesSet"`
+	// Social "save to Stash" library roots (not secret). Configured =
+	// both set.
+	SocialWriteRoot      string `json:"socialWriteRoot"`
+	SocialStashRoot      string `json:"socialStashRoot"`
+	SocialSaveConfigured bool   `json:"socialSaveConfigured"`
 }
 
 type configPostRequest struct {
@@ -267,14 +276,20 @@ type configPostRequest struct {
 	// X (Twitter) session cookies — must be set together.
 	XAuthToken *string `json:"xAuthToken,omitempty"`
 	XCT0       *string `json:"xCt0,omitempty"`
+	// Social library roots (where this daemon writes / where Stash sees it).
+	SocialWriteRoot *string `json:"socialWriteRoot,omitempty"`
+	SocialStashRoot *string `json:"socialStashRoot,omitempty"`
 }
 
 func (s *Server) getConfig(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, configGetResponse{
-		StashURL:        s.store.Get(configstore.KeyStashURL),
-		StashAPIKeySet:  s.store.Get(configstore.KeyStashAPIKey) != "",
-		RedditCookieSet: s.store.Get(configstore.KeyRedditCookie) != "",
-		XCookiesSet:     s.store.Get(configstore.KeyXAuthToken) != "" && s.store.Get(configstore.KeyXCT0) != "",
+		StashURL:             s.store.Get(configstore.KeyStashURL),
+		StashAPIKeySet:       s.store.Get(configstore.KeyStashAPIKey) != "",
+		RedditCookieSet:      s.store.Get(configstore.KeyRedditCookie) != "",
+		XCookiesSet:          s.store.Get(configstore.KeyXAuthToken) != "" && s.store.Get(configstore.KeyXCT0) != "",
+		SocialWriteRoot:      s.store.Get(configstore.KeySocialWriteRoot),
+		SocialStashRoot:      s.store.Get(configstore.KeySocialStashRoot),
+		SocialSaveConfigured: s.saver != nil && s.saver.Configured(),
 	})
 }
 
@@ -359,6 +374,26 @@ func (s *Server) postConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.applyXCookies()
+	}
+	// Social library roots — persisted then pushed into the saver so the
+	// change takes effect without a restart.
+	if req.SocialWriteRoot != nil {
+		if err := s.store.Set(configstore.KeySocialWriteRoot, strings.TrimSpace(*req.SocialWriteRoot)); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "persist failed"})
+			return
+		}
+	}
+	if req.SocialStashRoot != nil {
+		if err := s.store.Set(configstore.KeySocialStashRoot, strings.TrimSpace(*req.SocialStashRoot)); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "persist failed"})
+			return
+		}
+	}
+	if (req.SocialWriteRoot != nil || req.SocialStashRoot != nil) && s.saver != nil {
+		s.saver.SetPaths(
+			s.store.Get(configstore.KeySocialWriteRoot),
+			s.store.Get(configstore.KeySocialStashRoot),
+		)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
