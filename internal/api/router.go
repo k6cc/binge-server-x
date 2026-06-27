@@ -44,8 +44,9 @@ type Server struct {
 	refreshMu     sync.Mutex
 	lastRefreshAt time.Time
 
-	xCache    *xFeedCache
-	phStreams *phStreamCache
+	xCache     *xFeedCache
+	phStreams  *phStreamCache
+	phPreviews *phPreviewCache
 
 	allowedOrigins []string // CORS allowlist (parsed); loopback always OK
 }
@@ -66,6 +67,7 @@ func New(db *sql.DB, store *configstore.Store, poller Poller, stashClient *stash
 		log:            log,
 		xCache:         newXFeedCache(),
 		phStreams:      newPHStreamCache(),
+		phPreviews:     newPHPreviewCache(),
 		allowedOrigins: parseOrigins(allowedOrigin),
 	}
 }
@@ -92,6 +94,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/pornhub/stream/{videoId}", s.pornhubStream)
 	r.Head("/pornhub/stream/{videoId}", s.pornhubStream)
 	r.Get("/pornhub/thumb", s.pornhubThumb)
+	r.Get("/pornhub/preview/{videoId}", s.pornhubPreview)
 	return r
 }
 

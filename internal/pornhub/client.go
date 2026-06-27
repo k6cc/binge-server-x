@@ -192,6 +192,46 @@ func (c *Client) Download(ctx context.Context, videoURL, destPath string) error 
 	return err
 }
 
+// scrapeScript fetches a model page with browser impersonation
+// (curl_cffi — Go can't fetch PornHub directly, it 410s) and returns a
+// {viewkey: mediabook-preview-url} JSON map parsed from the video tiles.
+const scrapeScript = `
+import sys, json, re
+from curl_cffi import requests
+r = requests.get(sys.argv[1], impersonate="chrome", timeout=25)
+out = {}
+for t in re.findall(r'<li[^>]*videoblock[^>]*>.*?</li>', r.text, re.S):
+    vk = re.search(r'viewkey=([A-Za-z0-9]+)', t)
+    mb = re.search(r'data-mediabook="([^"]+)"', t)
+    if vk and mb:
+        out[vk.group(1)] = mb.group(1)
+print(json.dumps(out))
+`
+
+// FetchPreviews scrapes a model page for its videos' hover-preview
+// (mediabook) webm URLs, keyed by viewkey. Time-locked URLs, so callers
+// fetch fresh + proxy.
+func (c *Client) FetchPreviews(ctx context.Context, modelURL string) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "python3", "-c", scrapeScript, modelURL)
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return nil, fmt.Errorf("preview scrape: %s", msg)
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(stdout.String()), &m); err != nil {
+		return nil, fmt.Errorf("parse previews: %w", err)
+	}
+	return m, nil
+}
+
 func (c *Client) run(ctx context.Context, args ...string) ([]byte, error) {
 	// Retry transient rate-limits (403/429) — they happen when the
 	// backfill poll and an on-demand stream hit PornHub from the same exit

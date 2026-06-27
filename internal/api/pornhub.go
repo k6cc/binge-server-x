@@ -44,6 +44,37 @@ func (c *phStreamCache) put(id, url string) {
 	c.mu.Unlock()
 }
 
+// ── preview (mediabook) cache ───────────────────────────────────────
+// Per-model scrape result (viewkey -> preview webm url). One scrape
+// serves all of a performer's video previews; refreshed every few minutes
+// because the URLs are time-locked.
+const phPreviewTTL = 5 * time.Minute
+
+type phPreviewEntry struct {
+	m  map[string]string
+	at time.Time
+}
+type phPreviewCache struct {
+	mu sync.Mutex
+	m  map[string]phPreviewEntry // keyed by model url
+}
+
+func newPHPreviewCache() *phPreviewCache { return &phPreviewCache{m: map[string]phPreviewEntry{}} }
+func (c *phPreviewCache) get(modelURL string) (map[string]string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.m[modelURL]
+	if !ok || time.Since(e.at) > phPreviewTTL {
+		return nil, false
+	}
+	return e.m, true
+}
+func (c *phPreviewCache) put(modelURL string, m map[string]string) {
+	c.mu.Lock()
+	c.m[modelURL] = phPreviewEntry{m: m, at: time.Now()}
+	c.mu.Unlock()
+}
+
 // ── feed ────────────────────────────────────────────────────────────
 
 type phVideo struct {
@@ -233,6 +264,65 @@ func (s *Server) pornhubThumb(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	for _, h := range []string{"Content-Type", "Content-Length", "Cache-Control", "ETag"} {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// GET /pornhub/preview/{videoId} — proxy the hover-preview (mediabook)
+// webm so the client can loop it in story/feed cards (like Stash
+// previews). The url is scraped fresh per model (cached ~5m) + time/IP-
+// locked, so it must be proxied from this egress.
+func (s *Server) pornhubPreview(w http.ResponseWriter, r *http.Request) {
+	if s.pornhub == nil {
+		http.Error(w, "pornhub disabled", http.StatusServiceUnavailable)
+		return
+	}
+	vid := chi.URLParam(r, "videoId")
+	var modelURL string
+	if err := s.db.QueryRowContext(r.Context(), `
+		SELECT pp.ph_url FROM pornhub_videos pv
+		JOIN pornhub_performers pp ON pv.performer_stash_id = pp.stash_id
+		WHERE pv.video_id = ?`, vid).Scan(&modelURL); err != nil {
+		http.Error(w, "unknown video", http.StatusNotFound)
+		return
+	}
+	previews, ok := s.phPreviews.get(modelURL)
+	if !ok {
+		m, err := s.pornhub.FetchPreviews(r.Context(), modelURL)
+		if err != nil {
+			s.log.Warn("pornhub preview scrape", "video", vid, "err", err)
+			http.Error(w, "preview unavailable", http.StatusBadGateway)
+			return
+		}
+		s.phPreviews.put(modelURL, m)
+		previews = m
+	}
+	previewURL, ok := previews[vid]
+	if !ok {
+		http.Error(w, "no preview", http.StatusNotFound)
+		return
+	}
+	if u, err := url.Parse(previewURL); err != nil || !strings.HasSuffix(strings.ToLower(u.Host), "phncdn.com") {
+		http.Error(w, "bad preview url", http.StatusBadGateway)
+		return
+	}
+	req, _ := http.NewRequestWithContext(r.Context(), "GET", previewURL, nil)
+	req.Header.Set("Referer", "https://www.pornhub.com/")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; binge-server)")
+	if rh := r.Header.Get("Range"); rh != "" {
+		req.Header.Set("Range", rh)
+	}
+	resp, err := phStreamHTTP.Do(req)
+	if err != nil {
+		http.Error(w, "upstream", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	for _, h := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control"} {
 		if v := resp.Header.Get(h); v != "" {
 			w.Header().Set(h, v)
 		}
