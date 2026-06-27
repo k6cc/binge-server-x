@@ -193,6 +193,33 @@ func (c *Client) Download(ctx context.Context, videoURL, destPath string) error 
 }
 
 func (c *Client) run(ctx context.Context, args ...string) ([]byte, error) {
+	// Retry transient rate-limits (403/429) — they happen when the
+	// backfill poll and an on-demand stream hit PornHub from the same exit
+	// IP at once. A short backoff almost always clears them.
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(attempt) * 2 * time.Second):
+			}
+		}
+		out, err := c.runOnce(ctx, args...)
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+		m := err.Error()
+		if !strings.Contains(m, "403") && !strings.Contains(m, "429") &&
+			!strings.Contains(m, "Forbidden") && !strings.Contains(m, "rate") {
+			return nil, err // non-transient — don't retry
+		}
+	}
+	return nil, lastErr
+}
+
+func (c *Client) runOnce(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, c.bin, args...)
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
