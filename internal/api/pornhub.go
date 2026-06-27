@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"io"
 	"net/http"
@@ -75,6 +76,68 @@ func (c *phPreviewCache) put(modelURL string, m map[string]string) {
 	c.mu.Unlock()
 }
 
+// ── owned-viewkey dedup cache ───────────────────────────────────────
+// The set of PornHub viewkeys already in the user's Stash library
+// (scenes with a pornhub.com url). Feed/stories exclude these so owned
+// content doesn't resurface as "new". Refreshed lazily; the Stash sweep
+// is a few paginated queries, cheap enough to block a feed request when
+// stale but cached so repeat opens are instant.
+const phOwnedTTL = 5 * time.Minute
+
+type phOwnedCache struct {
+	mu  sync.Mutex
+	set map[string]struct{}
+	at  time.Time
+}
+
+func newPHOwnedCache() *phOwnedCache { return &phOwnedCache{} }
+
+// ownedViewkeys returns the cached owned-viewkey set, refreshing from
+// Stash when stale. Best-effort: a Stash error keeps the previous set
+// (or an empty one) rather than breaking the feed — dedup degrades to
+// "show everything," never to an error.
+func (s *Server) ownedViewkeys(ctx context.Context) map[string]struct{} {
+	s.phOwned.mu.Lock()
+	if s.phOwned.set != nil && time.Since(s.phOwned.at) < phOwnedTTL {
+		set := s.phOwned.set
+		s.phOwned.mu.Unlock()
+		return set
+	}
+	s.phOwned.mu.Unlock()
+
+	set, err := s.stash.OwnedPornhubViewkeys(ctx)
+	if err != nil {
+		s.log.Warn("pornhub owned-viewkey refresh", "err", err)
+		s.phOwned.mu.Lock()
+		old := s.phOwned.set
+		s.phOwned.mu.Unlock()
+		if old != nil {
+			return old
+		}
+		return map[string]struct{}{}
+	}
+	s.phOwned.mu.Lock()
+	s.phOwned.set = set
+	s.phOwned.at = time.Now()
+	s.phOwned.mu.Unlock()
+	return set
+}
+
+// dropOwned filters out videos whose viewkey is already owned in Stash.
+func dropOwned(vids []phVideo, owned map[string]struct{}) []phVideo {
+	if len(owned) == 0 {
+		return vids
+	}
+	out := make([]phVideo, 0, len(vids))
+	for _, v := range vids {
+		if _, ok := owned[v.ID]; ok {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
 // ── feed ────────────────────────────────────────────────────────────
 
 type phVideo struct {
@@ -114,9 +177,12 @@ func (s *Server) pornhubFeed(w http.ResponseWriter, r *http.Request) {
 	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 && v <= 200 {
 		limit = v
 	}
+	// saved_at IS NULL drops videos saved through binge; dropOwned then
+	// removes any already in the Stash library (owned some other way).
 	rows, err := s.db.QueryContext(r.Context(), `
 		SELECT video_id, title, url, thumb_url, duration, view_count, upload_date, created_utc
-		FROM pornhub_videos WHERE performer_stash_id=? ORDER BY created_utc DESC LIMIT ?`,
+		FROM pornhub_videos WHERE performer_stash_id=? AND saved_at IS NULL
+		ORDER BY created_utc DESC LIMIT ?`,
 		chi.URLParam(r, "stashId"), limit)
 	if err != nil {
 		s.log.Error("pornhubFeed query", "err", err)
@@ -129,7 +195,7 @@ func (s *Server) pornhubFeed(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "db", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, vids)
+	writeJSON(w, http.StatusOK, dropOwned(vids, s.ownedViewkeys(r.Context())))
 }
 
 // ── stories ─────────────────────────────────────────────────────────
@@ -146,11 +212,12 @@ type phStoryDigest struct {
 
 func (s *Server) pornhubStories(w http.ResponseWriter, r *http.Request) {
 	sinceUtc, _ := strconv.ParseInt(r.URL.Query().Get("sinceUtc"), 10, 64)
+	owned := s.ownedViewkeys(r.Context())
 	rows, err := s.db.QueryContext(r.Context(), `
 		SELECT p.stash_id, p.name, p.image_path, p.favorite,
 		       MAX(v.created_utc), COUNT(*)
 		FROM pornhub_performers p JOIN pornhub_videos v ON v.performer_stash_id=p.stash_id
-		WHERE v.created_utc >= ?
+		WHERE v.created_utc >= ? AND v.saved_at IS NULL
 		GROUP BY p.stash_id, p.name, p.image_path, p.favorite
 		ORDER BY MAX(v.created_utc) DESC`, sinceUtc)
 	if err != nil {
@@ -171,18 +238,30 @@ func (s *Server) pornhubStories(w http.ResponseWriter, r *http.Request) {
 		digs = append(digs, d)
 	}
 	rows.Close()
+	out := make([]phStoryDigest, 0, len(digs))
 	for i := range digs {
 		vr, err := s.db.QueryContext(r.Context(), `
 			SELECT video_id, title, url, thumb_url, duration, view_count, upload_date, created_utc
-			FROM pornhub_videos WHERE performer_stash_id=? AND created_utc >= ?
+			FROM pornhub_videos WHERE performer_stash_id=? AND created_utc >= ? AND saved_at IS NULL
 			ORDER BY created_utc DESC LIMIT 25`, digs[i].PerformerStashID, sinceUtc)
 		if err != nil {
 			continue
 		}
-		digs[i].Videos, _ = s.scanVideos(vr)
+		vids, _ := s.scanVideos(vr)
 		vr.Close()
+		vids = dropOwned(vids, owned)
+		// A performer whose recent videos are all owned/saved drops out
+		// of the row entirely; recompute count + latest from what's left
+		// (videos are DESC, so the head is the latest).
+		if len(vids) == 0 {
+			continue
+		}
+		digs[i].Videos = vids
+		digs[i].VideoCount = len(vids)
+		digs[i].LatestCreatedUtc = vids[0].CreatedUtc
+		out = append(out, digs[i])
 	}
-	writeJSON(w, http.StatusOK, digs)
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ── stream proxy ────────────────────────────────────────────────────

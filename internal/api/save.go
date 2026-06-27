@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ordureconnoisseur/binge-server/internal/social"
@@ -43,6 +44,17 @@ func (s *Server) saveToStash(w http.ResponseWriter, r *http.Request) {
 		s.log.Warn("save to stash failed", "source", req.Source, "performer", req.PerformerStashID, "err", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
+	}
+	// Mark a saved PornHub video so the feed/stories stop surfacing it
+	// immediately — independent of (and faster than) the background
+	// tagger writing the scene's url. req.ID is the viewkey = the
+	// pornhub_videos primary key. Best-effort.
+	if strings.EqualFold(req.Source, "pornhub") && req.ID != "" {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE pornhub_videos SET saved_at=datetime('now') WHERE video_id=?`,
+			req.ID); err != nil {
+			s.log.Warn("pornhub mark saved", "viewkey", req.ID, "err", err)
+		}
 	}
 	writeJSON(w, http.StatusOK, res)
 }

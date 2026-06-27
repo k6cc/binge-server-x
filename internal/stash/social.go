@@ -2,6 +2,7 @@ package stash
 
 import (
 	"context"
+	"net/url"
 	"strings"
 )
 
@@ -224,6 +225,65 @@ func PerformerHandle(p Performer, source string) string {
 		}
 	}
 	return ""
+}
+
+// OwnedPornhubViewkeys returns the set of PornHub viewkeys for scenes
+// already in the library — any scene whose url contains "pornhub.com".
+// Used to dedup the PornHub feed/stories so videos the user already has
+// (saved through binge OR imported some other way) don't resurface.
+// Paginated; the viewkey is read from each url's `viewkey` query param.
+func (c *Client) OwnedPornhubViewkeys(ctx context.Context) (map[string]struct{}, error) {
+	const q = `
+query BingeOwnedPornhub($page: Int!, $perPage: Int!) {
+  findScenes(
+    filter: { page: $page, per_page: $perPage, sort: "id", direction: ASC }
+    scene_filter: { url: { value: "pornhub.com", modifier: INCLUDES } }
+  ) {
+    count
+    scenes { urls }
+  }
+}`
+	const perPage = 500
+	out := map[string]struct{}{}
+	for page := 1; ; page++ {
+		var resp struct {
+			FindScenes struct {
+				Count  int `json:"count"`
+				Scenes []struct {
+					URLs []string `json:"urls"`
+				} `json:"scenes"`
+			} `json:"findScenes"`
+		}
+		if err := c.do(ctx, q, map[string]any{"page": page, "perPage": perPage}, &resp); err != nil {
+			return nil, err
+		}
+		for _, sc := range resp.FindScenes.Scenes {
+			for _, u := range sc.URLs {
+				if vk := PornhubViewkey(u); vk != "" {
+					out[vk] = struct{}{}
+				}
+			}
+		}
+		if len(resp.FindScenes.Scenes) == 0 || page*perPage >= resp.FindScenes.Count {
+			break
+		}
+	}
+	return out, nil
+}
+
+// PornhubViewkey extracts the `viewkey` from a pornhub.com watch URL,
+// or "" if the url isn't a pornhub link / has no viewkey. The viewkey is
+// PornHub's stable per-video id (matches the daemon's pornhub_videos
+// primary key) so this is an exact, not fuzzy, dedup key.
+func PornhubViewkey(raw string) string {
+	if !strings.Contains(strings.ToLower(raw), "pornhub.com") {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Query().Get("viewkey")
 }
 
 // SanitizeSegment makes a string safe to use as a single path segment

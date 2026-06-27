@@ -47,6 +47,7 @@ type Server struct {
 	xCache     *xFeedCache
 	phStreams  *phStreamCache
 	phPreviews *phPreviewCache
+	phOwned    *phOwnedCache
 
 	allowedOrigins []string // CORS allowlist (parsed); loopback always OK
 }
@@ -68,6 +69,7 @@ func New(db *sql.DB, store *configstore.Store, poller Poller, stashClient *stash
 		xCache:         newXFeedCache(),
 		phStreams:      newPHStreamCache(),
 		phPreviews:     newPHPreviewCache(),
+		phOwned:        newPHOwnedCache(),
 		allowedOrigins: parseOrigins(allowedOrigin),
 	}
 }
