@@ -35,6 +35,38 @@ CREATE TABLE IF NOT EXISTS sync_state (
   value TEXT
 );
 
+-- ── PornHub pillar ──────────────────────────────────────────────────
+-- Separate from the reddit performers/posts tables so the working reddit
+-- pillar is untouched. Performers linked to a pornhub.com pornstar/model
+-- page; their videos polled (yt-dlp) + cached so we don't re-fetch every
+-- time. Stream URLs are NOT cached (time/IP-locked) — extracted on demand.
+CREATE TABLE IF NOT EXISTS pornhub_performers (
+  stash_id        INTEGER PRIMARY KEY,
+  name            TEXT NOT NULL,
+  image_path      TEXT NOT NULL DEFAULT '',
+  favorite        INTEGER NOT NULL DEFAULT 0,
+  ph_url          TEXT NOT NULL,                    -- model/pornstar /videos page
+  ph_status       TEXT NOT NULL DEFAULT 'ok',       -- 'ok' | 'unavailable'
+  last_polled_at  TEXT,
+  synced_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ph_perf_polled ON pornhub_performers(last_polled_at);
+
+CREATE TABLE IF NOT EXISTS pornhub_videos (
+  video_id           TEXT PRIMARY KEY,              -- viewkey (e.g. ph5f35...)
+  performer_stash_id INTEGER NOT NULL REFERENCES pornhub_performers(stash_id) ON DELETE CASCADE,
+  title              TEXT,
+  url                TEXT NOT NULL,                 -- view_video.php?viewkey=...
+  thumb_url          TEXT,
+  duration           INTEGER,                       -- seconds
+  view_count         INTEGER,
+  upload_date        TEXT,                          -- YYYYMMDD (yt-dlp shape)
+  created_utc        INTEGER NOT NULL DEFAULT 0,    -- upload_date as unix, for sort/stories
+  fetched_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ph_vid_performer ON pornhub_videos(performer_stash_id, created_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_ph_vid_created ON pornhub_videos(created_utc DESC);
+
 -- Live config — populated via /config POST from the binge UI (and
 -- optionally seeded from env vars at startup for back-compat). Holds
 -- the Reddit session cookie + Stash API key + Stash URL so the daemon

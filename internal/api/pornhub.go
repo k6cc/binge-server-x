@@ -1,0 +1,242 @@
+package api
+
+import (
+	"database/sql"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+)
+
+// ── stream-URL extraction cache ─────────────────────────────────────
+// Extracted PornHub mp4 URLs are time/IP-locked, so we cache them only
+// briefly (long enough to serve a viewing session's range requests, well
+// under their validfrom window) and re-extract after.
+const phStreamTTL = 4 * time.Minute
+
+type phStreamEntry struct {
+	url string
+	at  time.Time
+}
+type phStreamCache struct {
+	mu sync.Mutex
+	m  map[string]phStreamEntry
+}
+
+func newPHStreamCache() *phStreamCache { return &phStreamCache{m: map[string]phStreamEntry{}} }
+func (c *phStreamCache) get(id string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.m[id]
+	if !ok || time.Since(e.at) > phStreamTTL {
+		return "", false
+	}
+	return e.url, true
+}
+func (c *phStreamCache) put(id, url string) {
+	c.mu.Lock()
+	c.m[id] = phStreamEntry{url: url, at: time.Now()}
+	c.mu.Unlock()
+}
+
+// ── feed ────────────────────────────────────────────────────────────
+
+type phVideo struct {
+	ID         string  `json:"id"`         // viewkey
+	Title      *string `json:"title"`
+	SourceURL  string  `json:"sourceUrl"`  // pornhub watch page
+	ThumbURL   *string `json:"thumbUrl"`   // raw phncdn (web proxies it)
+	Duration   int     `json:"duration"`
+	ViewCount  int64   `json:"viewCount"`
+	UploadDate *string `json:"uploadDate"`
+	CreatedUtc int64   `json:"createdUtc"`
+}
+
+func (s *Server) scanVideos(rows *sql.Rows) ([]phVideo, error) {
+	out := []phVideo{}
+	for rows.Next() {
+		var v phVideo
+		var title, thumb, up sql.NullString
+		if err := rows.Scan(&v.ID, &title, &v.SourceURL, &thumb, &v.Duration, &v.ViewCount, &up, &v.CreatedUtc); err != nil {
+			return nil, err
+		}
+		v.Title = nullStr(title)
+		v.ThumbURL = nullStr(thumb)
+		v.UploadDate = nullStr(up)
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// GET /pornhub/feed/{stashId} — the performer's cached PornHub videos.
+func (s *Server) pornhubFeed(w http.ResponseWriter, r *http.Request) {
+	if _, err := strconv.Atoi(chi.URLParam(r, "stashId")); err != nil {
+		http.Error(w, "bad stashId", http.StatusBadRequest)
+		return
+	}
+	limit := 60
+	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 && v <= 200 {
+		limit = v
+	}
+	rows, err := s.db.QueryContext(r.Context(), `
+		SELECT video_id, title, url, thumb_url, duration, view_count, upload_date, created_utc
+		FROM pornhub_videos WHERE performer_stash_id=? ORDER BY created_utc DESC LIMIT ?`,
+		chi.URLParam(r, "stashId"), limit)
+	if err != nil {
+		s.log.Error("pornhubFeed query", "err", err)
+		http.Error(w, "db", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	vids, err := s.scanVideos(rows)
+	if err != nil {
+		http.Error(w, "db", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, vids)
+}
+
+// ── stories ─────────────────────────────────────────────────────────
+
+type phStoryDigest struct {
+	PerformerStashID   int       `json:"performerStashId"`
+	PerformerName      string    `json:"performerName"`
+	PerformerImagePath string    `json:"performerImagePath"`
+	PerformerFavorite  bool      `json:"performerFavorite"`
+	LatestCreatedUtc   int64     `json:"latestCreatedUtc"`
+	VideoCount         int       `json:"videoCount"`
+	Videos             []phVideo `json:"videos"`
+}
+
+func (s *Server) pornhubStories(w http.ResponseWriter, r *http.Request) {
+	sinceUtc, _ := strconv.ParseInt(r.URL.Query().Get("sinceUtc"), 10, 64)
+	rows, err := s.db.QueryContext(r.Context(), `
+		SELECT p.stash_id, p.name, p.image_path, p.favorite,
+		       MAX(v.created_utc), COUNT(*)
+		FROM pornhub_performers p JOIN pornhub_videos v ON v.performer_stash_id=p.stash_id
+		WHERE v.created_utc >= ?
+		GROUP BY p.stash_id, p.name, p.image_path, p.favorite
+		ORDER BY MAX(v.created_utc) DESC`, sinceUtc)
+	if err != nil {
+		s.log.Error("pornhubStories digest", "err", err)
+		http.Error(w, "db", http.StatusInternalServerError)
+		return
+	}
+	digs := []phStoryDigest{}
+	for rows.Next() {
+		var d phStoryDigest
+		var fav int
+		if err := rows.Scan(&d.PerformerStashID, &d.PerformerName, &d.PerformerImagePath, &fav, &d.LatestCreatedUtc, &d.VideoCount); err != nil {
+			rows.Close()
+			http.Error(w, "db", http.StatusInternalServerError)
+			return
+		}
+		d.PerformerFavorite = fav != 0
+		digs = append(digs, d)
+	}
+	rows.Close()
+	for i := range digs {
+		vr, err := s.db.QueryContext(r.Context(), `
+			SELECT video_id, title, url, thumb_url, duration, view_count, upload_date, created_utc
+			FROM pornhub_videos WHERE performer_stash_id=? AND created_utc >= ?
+			ORDER BY created_utc DESC LIMIT 25`, digs[i].PerformerStashID, sinceUtc)
+		if err != nil {
+			continue
+		}
+		digs[i].Videos, _ = s.scanVideos(vr)
+		vr.Close()
+	}
+	writeJSON(w, http.StatusOK, digs)
+}
+
+// ── stream proxy ────────────────────────────────────────────────────
+// Extract the progressive mp4 (cached briefly) then relay its bytes with
+// Range support, so the client plays inline without the IP/time-locked
+// CDN URL ever leaving this egress.
+var phStreamHTTP = &http.Client{Timeout: 60 * time.Second}
+
+func (s *Server) pornhubStream(w http.ResponseWriter, r *http.Request) {
+	if s.pornhub == nil {
+		http.Error(w, "pornhub disabled", http.StatusServiceUnavailable)
+		return
+	}
+	vid := chi.URLParam(r, "videoId")
+	mp4, ok := s.phStreams.get(vid)
+	if !ok {
+		// Resolve the watch URL from the cache table, then extract.
+		var watch string
+		if err := s.db.QueryRowContext(r.Context(), `SELECT url FROM pornhub_videos WHERE video_id=?`, vid).Scan(&watch); err != nil {
+			http.Error(w, "unknown video", http.StatusNotFound)
+			return
+		}
+		u, err := s.pornhub.ExtractStreamURL(r.Context(), watch)
+		if err != nil {
+			s.log.Warn("pornhub stream extract", "video", vid, "err", err)
+			http.Error(w, "extract failed", http.StatusBadGateway)
+			return
+		}
+		mp4 = u
+		s.phStreams.put(vid, u)
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, mp4, nil)
+	if err != nil {
+		http.Error(w, "build request", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; binge-server)")
+	req.Header.Set("Referer", "https://www.pornhub.com/")
+	if rh := r.Header.Get("Range"); rh != "" {
+		req.Header.Set("Range", rh)
+	}
+	resp, err := phStreamHTTP.Do(req)
+	if err != nil {
+		http.Error(w, "upstream", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	for _, h := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control"} {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if r.Method != http.MethodHead {
+		_, _ = io.Copy(w, resp.Body)
+	}
+}
+
+// ── thumbnail proxy ─────────────────────────────────────────────────
+// PornHub thumbnails are on phncdn.com (an adult CDN some networks
+// block); relay them through this egress. Allowlist phncdn only.
+var phThumbHTTP = &http.Client{Timeout: 20 * time.Second}
+
+func (s *Server) pornhubThumb(w http.ResponseWriter, r *http.Request) {
+	raw := r.URL.Query().Get("url")
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || !strings.HasSuffix(strings.ToLower(u.Host), "phncdn.com") {
+		http.Error(w, "host not allowed", http.StatusForbidden)
+		return
+	}
+	req, _ := http.NewRequestWithContext(r.Context(), "GET", raw, nil)
+	req.Header.Set("Referer", "https://www.pornhub.com/")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; binge-server)")
+	resp, err := phThumbHTTP.Do(req)
+	if err != nil {
+		http.Error(w, "upstream", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	for _, h := range []string{"Content-Type", "Content-Length", "Cache-Control", "ETag"} {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}

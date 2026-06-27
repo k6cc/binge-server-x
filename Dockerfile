@@ -24,13 +24,16 @@ RUN go build -trimpath \
     -o /out/binge-server .
 
 # ── Runtime stage ──────────────────────────────────────────────────
-# python:slim (not distroless): the X/Twitter feed shells out to
-# gallery-dl, a Python tool. gallery-dl is intentionally UNPINNED — X
-# rotates its private GraphQL query-ids periodically and breaks older
-# gallery-dl; a plain image rebuild pulls the current release that fixes
-# it. (--no-download keeps us to metadata only, so no ffmpeg needed.)
+# python:slim (not distroless): we shell out to gallery-dl (X/Instagram)
+# and yt-dlp (PornHub). Both UNPINNED — these sites rotate their private
+# APIs / query-ids periodically and break older releases; a plain image
+# rebuild pulls the current versions that fix it. curl_cffi gives yt-dlp
+# the browser TLS impersonation PornHub demands (410s without it); ffmpeg
+# is for any HLS-only PornHub download/merge.
 FROM python:3.12-slim
-RUN pip install --no-cache-dir gallery-dl
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir gallery-dl yt-dlp curl_cffi
 COPY --from=build /out/binge-server /usr/local/bin/binge-server
 
 # Persistent data (SQLite + the generated gallery-dl cookie config).

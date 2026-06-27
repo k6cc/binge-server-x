@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ordureconnoisseur/binge-server/internal/pornhub"
 	"github.com/ordureconnoisseur/binge-server/internal/stash"
 )
 
@@ -41,22 +42,24 @@ var sourceLabels = map[string]string{
 	"reddit":    "Reddit",
 	"redgifs":   "Redgifs",
 	"instagram": "Instagram",
+	"pornhub":   "PornHub",
 }
 
 const socialParentTag = "Social Media"
 
 type Saver struct {
-	stash  *stash.Client
-	http   *http.Client
-	logger *slog.Logger
+	stash   *stash.Client
+	http    *http.Client
+	pornhub *pornhub.Client
+	logger  *slog.Logger
 
 	mu        sync.RWMutex
 	writeRoot string // path THIS daemon writes to (e.g. /library/social)
 	stashRoot string // path Stash sees the same files at (e.g. Z:\Media\social)
 }
 
-func New(st *stash.Client, logger *slog.Logger) *Saver {
-	return &Saver{stash: st, http: &http.Client{Timeout: 180 * time.Second}, logger: logger}
+func New(st *stash.Client, ph *pornhub.Client, logger *slog.Logger) *Saver {
+	return &Saver{stash: st, pornhub: ph, http: &http.Client{Timeout: 180 * time.Second}, logger: logger}
 }
 
 func (s *Saver) log(msg, detail string) {
@@ -234,6 +237,14 @@ func (s *Saver) download(ctx context.Context, req SaveRequest, dir, dest string)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
+	}
+	// PornHub has no direct media URL — yt-dlp extracts + downloads the
+	// video from the watch page (req.MediaURL).
+	if strings.ToLower(req.Source) == "pornhub" {
+		if s.pornhub == nil {
+			return errors.New("pornhub downloader unavailable")
+		}
+		return s.pornhub.Download(ctx, req.MediaURL, dest)
 	}
 	hr, err := http.NewRequestWithContext(ctx, "GET", req.MediaURL, nil)
 	if err != nil {

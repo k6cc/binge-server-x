@@ -19,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/ordureconnoisseur/binge-server/internal/configstore"
+	"github.com/ordureconnoisseur/binge-server/internal/pornhub"
 	"github.com/ordureconnoisseur/binge-server/internal/social"
 	"github.com/ordureconnoisseur/binge-server/internal/stash"
 	"github.com/ordureconnoisseur/binge-server/internal/twitter"
@@ -37,12 +38,14 @@ type Server struct {
 	stash   *stash.Client
 	twitter *twitter.Client
 	saver   *social.Saver
+	pornhub *pornhub.Client
 	log     *slog.Logger
 
 	refreshMu     sync.Mutex
 	lastRefreshAt time.Time
 
-	xCache *xFeedCache
+	xCache    *xFeedCache
+	phStreams *phStreamCache
 
 	allowedOrigins []string // CORS allowlist (parsed); loopback always OK
 }
@@ -51,7 +54,7 @@ type Server struct {
 // polls. Manual hammering won't translate to bursts on Reddit.
 const refreshCooldown = 30 * time.Second
 
-func New(db *sql.DB, store *configstore.Store, poller Poller, stashClient *stash.Client, twitterClient *twitter.Client, saver *social.Saver, log *slog.Logger, allowedOrigin string) *Server {
+func New(db *sql.DB, store *configstore.Store, poller Poller, stashClient *stash.Client, twitterClient *twitter.Client, saver *social.Saver, pornhubClient *pornhub.Client, log *slog.Logger, allowedOrigin string) *Server {
 	return &Server{
 		db:             db,
 		store:          store,
@@ -59,8 +62,10 @@ func New(db *sql.DB, store *configstore.Store, poller Poller, stashClient *stash
 		stash:          stashClient,
 		twitter:        twitterClient,
 		saver:          saver,
+		pornhub:        pornhubClient,
 		log:            log,
 		xCache:         newXFeedCache(),
+		phStreams:      newPHStreamCache(),
 		allowedOrigins: parseOrigins(allowedOrigin),
 	}
 }
@@ -82,6 +87,11 @@ func (s *Server) Router() http.Handler {
 	r.Get("/x/feed/{stashId}", s.xFeed)
 	r.Get("/x/handle/{handle}", s.xFeedByHandle)
 	r.Post("/save", s.saveToStash)
+	r.Get("/pornhub/feed/{stashId}", s.pornhubFeed)
+	r.Get("/pornhub/stories", s.pornhubStories)
+	r.Get("/pornhub/stream/{videoId}", s.pornhubStream)
+	r.Head("/pornhub/stream/{videoId}", s.pornhubStream)
+	r.Get("/pornhub/thumb", s.pornhubThumb)
 	return r
 }
 

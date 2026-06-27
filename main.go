@@ -16,6 +16,7 @@ import (
 	"github.com/ordureconnoisseur/binge-server/internal/configstore"
 	"github.com/ordureconnoisseur/binge-server/internal/db"
 	"github.com/ordureconnoisseur/binge-server/internal/poller"
+	"github.com/ordureconnoisseur/binge-server/internal/pornhub"
 	"github.com/ordureconnoisseur/binge-server/internal/reddit"
 	"github.com/ordureconnoisseur/binge-server/internal/redgifs"
 	"github.com/ordureconnoisseur/binge-server/internal/social"
@@ -74,8 +75,18 @@ func main() {
 
 	// Social "save to Stash" pipeline (downloads + places + tags). Paths
 	// come from config; unset = feature off (API 503s, UI hides the button).
-	saverSvc := social.New(stashClient, log.With("component", "saver"))
+	// PornHub pillar — yt-dlp client + its own poller (separate tables, so
+	// the reddit pillar is untouched).
+	pornhubClient := pornhub.New()
+
+	saverSvc := social.New(stashClient, pornhubClient, log.With("component", "saver"))
 	saverSvc.SetPaths(store.Get(configstore.KeySocialWriteRoot), store.Get(configstore.KeySocialStashRoot))
+
+	pornhubPoller := pornhub.NewPoller(
+		database, store, stashClient, pornhubClient,
+		log.With("component", "pornhub"),
+		cfg.performerSyncInterval, cfg.pornhubPollInterval,
+	)
 
 	pollerSvc := poller.New(
 		database, store, stashClient, redditClient, redgifsClient,
@@ -83,12 +94,13 @@ func main() {
 		cfg.performerSyncInterval, cfg.pollInterval,
 	)
 
-	server := api.New(database, store, pollerSvc, stashClient, twitterClient, saverSvc, log.With("component", "api"), cfg.allowedOrigin)
+	server := api.New(database, store, pollerSvc, stashClient, twitterClient, saverSvc, pornhubClient, log.With("component", "api"), cfg.allowedOrigin)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go pollerSvc.Run(ctx)
+	go pornhubPoller.Run(ctx)
 
 	httpServer := &http.Server{
 		Addr:              cfg.listenAddr,
@@ -127,6 +139,7 @@ type config struct {
 	redditUserAgent       string
 	pollInterval          time.Duration
 	performerSyncInterval time.Duration
+	pornhubPollInterval   time.Duration
 	allowedOrigin         string
 }
 
@@ -145,6 +158,9 @@ func loadConfig() config {
 		redditUserAgent:       ua + " " + Version,
 		pollInterval:          envDuration("BINGE_POLL_INTERVAL", 4*time.Hour),
 		performerSyncInterval: envDuration("BINGE_PERFORMER_SYNC_INTERVAL", 24*time.Hour),
+		// PornHub polling is heavier (yt-dlp per performer), so default to
+		// a longer cadence than reddit.
+		pornhubPollInterval: envDuration("BINGE_PORNHUB_POLL_INTERVAL", 12*time.Hour),
 		// CORS allowlist. Loopback / private / tailnet Stash origins are
 		// allowed automatically (zero config for the common self-hosted
 		// case). Set this only when Stash is served from a PUBLIC origin
