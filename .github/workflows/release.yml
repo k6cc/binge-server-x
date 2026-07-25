@@ -25,83 +25,72 @@ permissions:
 
 jobs:
   binaries:
-    name: build binary (${{ matrix.goos }}-${{ matrix.goarch }})
+    name: build all binaries
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - goos: darwin
-            goarch: arm64
-            ext: ""
-            archive: tar.gz
-          - goos: darwin
-            goarch: amd64
-            ext: ""
-            archive: tar.gz
-          - goos: linux
-            goarch: amd64
-            ext: ""
-            archive: tar.gz
-          - goos: linux
-            goarch: arm64
-            ext: ""
-            archive: tar.gz
-          - goos: windows
-            goarch: amd64
-            ext: ".exe"
-            archive: zip
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.22"
           cache: true
 
-      - name: Build
+      # Build all 5 targets in a single job so there is only one
+      # softprops/action-gh-release call (avoids the "release already
+      # exists" race when multiple matrix jobs create the same tag).
+      - name: Build all platforms
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
           VERSION: ${{ inputs.version }}
+          CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-          go build -trimpath \
-            -ldflags="-s -w -X main.Version=${VERSION}" \
-            -o "dist/binge-server${{ matrix.ext }}" .
+          build_one() {
+            local goos="$1" goarch="$2" ext="$3" archive="$4"
+            echo "::group::Building ${goos}/${goarch}"
+            GOOS="${goos}" GOARCH="${goarch}" \
+              go build -trimpath \
+                -ldflags="-s -w -X main.Version=${VERSION}" \
+                -o "dist/binge-server${ext}" .
+            NAME="binge-server_${VERSION}_${goos}_${goarch}"
+            STAGE="release/${NAME}"
+            mkdir -p "${STAGE}"
+            cp "dist/binge-server${ext}" "${STAGE}/"
+            cp README.md LICENSE "${STAGE}/"
+            cd release
+            if [ "${archive}" = "zip" ]; then
+              zip -r "../${NAME}.zip" "${NAME}"
+            else
+              tar -czf "../${NAME}.tar.gz" "${NAME}"
+            fi
+            cd ..
+            rm -f "dist/binge-server${ext}"
+            rm -rf "release/${NAME}"
+            echo "::endgroup::"
+          }
+          build_one darwin arm64 ""      tar.gz
+          build_one darwin amd64 ""      tar.gz
+          build_one linux  amd64 ""      tar.gz
+          build_one linux  arm64 ""      tar.gz
+          build_one windows amd64 ".exe" zip
 
-      - name: Pack archive
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          NAME="binge-server_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}"
-          STAGE="release/${NAME}"
-          mkdir -p "${STAGE}"
-          cp "dist/binge-server${{ matrix.ext }}" "${STAGE}/"
-          cp README.md LICENSE "${STAGE}/"
-          cd release
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            zip -r "../${NAME}.zip" "${NAME}"
-          else
-            tar -czvf "../${NAME}.tar.gz" "${NAME}"
-          fi
+      - name: List artifacts
+        run: ls -la *.zip *.tar.gz
 
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload to Release (single call)
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.version }}
           name: ${{ inputs.version }}
           files: |
-            binge-server_${{ inputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip
-            binge-server_${{ inputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
+            binge-server_${{ inputs.version }}_*.zip
+            binge-server_${{ inputs.version }}_*.tar.gz
           generate_release_notes: true
 
   docker:
     name: docker image (multi-arch)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: docker/setup-qemu-action@v3
 
