@@ -1,0 +1,6 @@
+# Force LF for files that end up inside the Linux Docker image or are
+# parsed by tools that choke on CRLF. Without this, Windows checkouts
+# (core.autocrlf=true) would turn docker-entrypoint.sh into CRLF and
+# the container would fail with "/bin/sh^M: bad interpreter".
+*.sh      text eol=lf
+Dockerfile text eol=lf

@@ -235,7 +235,10 @@ func (s *Saver) download(ctx context.Context, req SaveRequest, dir, dest string)
 	if _, err := os.Stat(dest); err == nil {
 		return nil // already downloaded
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 0o777 lets the process umask (e.g. UMASK=002 in Docker) fully
+	// control the final mode — without this, a hard-coded 0o755 would
+	// mask out the group-write bit even when the user asked for it.
+	if err := os.MkdirAll(dir, 0o777); err != nil {
 		return err
 	}
 	// PornHub has no direct media URL — yt-dlp extracts + downloads the

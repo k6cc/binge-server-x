@@ -6,8 +6,10 @@
 #   - docker: build a multi-arch image and push to ghcr.io as
 #     ghcr.io/<owner>/binge-server:<version> + :latest.
 #
-# Triggered manually from the Actions UI (workflow_dispatch).
-# Go to Actions tab -> release -> Run workflow -> enter version -> Run.
+# Triggered by either:
+#   - pushing a tag (v*) — version is derived from the tag name
+#   - manual workflow_dispatch from the Actions UI (enter a version)
+#     Go to Actions tab -> release -> Run workflow -> enter version -> Run.
 name: release
 
 on:
@@ -18,6 +20,19 @@ on:
         required: true
         default: 'v0.1.0-twitter'
         type: string
+  # Auto-trigger on tag push (e.g. v0.1.4-x). The version is resolved
+  # from the tag name (env.VERSION below); manual workflow_dispatch still
+  # works for ad-hoc builds where you want to pick the version label
+  # yourself.
+  push:
+    tags:
+      - 'v*'
+
+# VERSION resolves to inputs.version on workflow_dispatch, or the tag
+# name on tag push. Used by both jobs for naming binaries, the GitHub
+# Release, and the docker image tag.
+env:
+  VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
 
 permissions:
   contents: write   # for GitHub Releases
@@ -40,7 +55,6 @@ jobs:
       # exists" race when multiple matrix jobs create the same tag).
       - name: Build all platforms
         env:
-          VERSION: ${{ inputs.version }}
           CGO_ENABLED: "0"
         run: |
           mkdir -p dist
@@ -79,11 +93,11 @@ jobs:
       - name: Upload to Release (single call)
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ inputs.version }}
-          name: ${{ inputs.version }}
+          tag_name: ${{ env.VERSION }}
+          name: ${{ env.VERSION }}
           files: |
-            binge-server_${{ inputs.version }}_*.zip
-            binge-server_${{ inputs.version }}_*.tar.gz
+            binge-server_${{ env.VERSION }}_*.zip
+            binge-server_${{ env.VERSION }}_*.tar.gz
           generate_release_notes: true
 
   docker:
@@ -115,9 +129,9 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ steps.image.outputs.ref }}:${{ inputs.version }}
+            ${{ steps.image.outputs.ref }}:${{ env.VERSION }}
             ${{ steps.image.outputs.ref }}:latest
           build-args: |
-            VERSION=${{ inputs.version }}
+            VERSION=${{ env.VERSION }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

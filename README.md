@@ -90,8 +90,23 @@ Both are stored in SQLite (`binge-server.db`, in `/data` if you mounted the Dock
 | `STASH_API_KEY` | (empty) | Initial seed — auto-detected from Stash same-origin in normal use |
 | `REDDIT_SESSION_COOKIE` | (empty) | Initial seed — paste via UI in normal use |
 | `REDDIT_USER_AGENT` | `binge-server/0.2` | Identifier sent to Reddit (their ToS requires a distinctive UA) |
+| `PUID` | `1000` | **Docker only.** UID the daemon runs as after the entrypoint drops privileges. Mirrors the linuxserver.io convention — set to `99` on unraid. |
+| `PGID` | `1000` | **Docker only.** GID the daemon runs as. Set to `100` on unraid. |
+| `UMASK` | `022` | **Docker only.** Octal umask applied before exec. `002` yields `drwxrwxr-x` folders + `-rw-rw-r--` files (the standard unraid setup). |
 
-The env vars are *initial seeds* — they populate the live config store only if the corresponding key is unset. Once you've configured via the UI, the env vars stop mattering.
+The env vars are *initial seeds* — they populate the live config store only if the corresponding key is unset. Once you've configured via the UI, the env vars stop mattering. `PUID` / `PGID` / `UMASK` are **not** seeds — they're read by `docker-entrypoint.sh` on every container start.
+
+### File ownership & permissions (PUID / PGID / UMASK)
+
+The Docker image ships a static `app` account (uid/gid 1000:1000). On container start, `docker-entrypoint.sh`:
+
+1. Rewrites `app`'s uid/gid to `PUID`/`PGID` (so common unraid values like `PUID=99`/`PGID=100` — `nobody:users` — work without rebuilding the image).
+2. `chown`s `/data` to the resolved uid/gid (cheap: `/data` only holds the SQLite DB + the gallery-dl cookie config, not media).
+3. Applies `UMASK` and re-execs `binge-server` via `gosu` as `app`.
+
+Result: every file the daemon creates — SQLite DB, saved media under `BINGE_SOCIAL_WRITE_ROOT`, yt-dlp / gallery-dl outputs — is owned by `PUID:PGID` with a mode derived from `UMASK`. With `UMASK=002` you get `drwxrwxr-x` folders and `-rw-rw-r--` files, the standard unraid setup.
+
+> **Note:** the entrypoint only `chown`s `/data`. If you mount `BINGE_SOCIAL_WRITE_ROOT` from a host path that's already root-owned, set its owner on the host (`chown -R 99:100 /mnt/user/...`) — the daemon can't fix pre-existing files in a path it doesn't know about at startup.
 
 ## How performer discovery works
 
